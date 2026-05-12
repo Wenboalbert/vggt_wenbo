@@ -119,7 +119,8 @@ def demo_fn(args):
 
     # Get image paths and preprocess them
     image_dir = os.path.join(args.scene_dir, "images")
-    image_path_list = glob.glob(os.path.join(image_dir, "*"))
+    image_path_list = sorted(glob.glob(os.path.join(image_dir, "*"))) #新的内容，为了使不同的相机的图片能处于同一个区
+    #image_path_list = glob.glob(os.path.join(image_dir, "*")) #旧的内容
     if len(image_path_list) == 0:
         raise ValueError(f"No images found in {image_dir}")
     base_image_path_list = [os.path.basename(path) for path in image_path_list]
