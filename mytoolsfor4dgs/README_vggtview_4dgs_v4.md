@@ -1,110 +1,220 @@
-# VGGTView to 4DGS v4
+# VGGTView to 4DGS v4 - multi-moving-camera version
 
-This toolkit prepares 4DGS training data for a multi-camera dynamic scene where most cameras are fixed and one camera moves.
+This toolkit prepares 4DGS training data for a multi-camera dynamic scene.
+It supports:
 
-It uses VGGT per synchronized frame group, aligns all per-frame VGGT coordinate systems using the fixed cameras, then writes a VGGTView scene for 4DGS.
+- A flat image folder.
+- A dataset root with one folder per camera.
+- An unknown number of fixed cameras.
+- One or more moving cameras.
+- Mixed landscape / portrait images, when image normalization is enabled.
 
-## Inputs
+The core idea is unchanged: VGGT is run for every synchronized time step, then all per-frame VGGT coordinate systems are aligned into one global coordinate system using the fixed cameras as anchors. The final output is a 4DGS `VGGTView` scene.
 
-A flat image folder:
+## Input layouts
 
-- cctv1_000000.png
-- cctv2_000000.png
-- cctv3_000000.png
-- phone1_000000.png
-- cctv1_000001.png
-- cctv2_000001.png
-- cctv3_000001.png
-- phone1_000001.png
+### Layout A: flat folder
 
-The final numeric token is the frame id. The prefix before it is the camera name.
+```text
+all_images/
+  CCTV_01_000000.png
+  CCTV_02_000000.png
+  Drone_Main_000000.png
+  Phone_Main_000000.png
+  CCTV_01_000001.png
+  CCTV_02_000001.png
+  Drone_Main_000001.png
+  Phone_Main_000001.png
+```
 
-## Step 1: patch VGGT image ordering
+### Layout B: one folder per camera
 
-python patch_vggt_demo_colmap_sort.py --demo_colmap /path/to/vggt_wenbo/demo_colmap.py
+```text
+city_1_datasets/
+  cctv_01/
+    CCTV_01_000000.png
+    CCTV_01_000001.png
+    depth/
+      ... ignored ...
+  cctv_02/
+    CCTV_02_000000.png
+    CCTV_02_000001.png
+  try_drone/
+    Drone_Main_000000.png
+    Drone_Main_000001.png
+  phone/
+    Phone_Main_000000.png
+    Phone_Main_000001.png
+```
 
-This only changes the image glob line to a sorted glob, making each per-frame VGGT batch deterministic.
+By default the camera name is parsed from the image filename, not from the folder name. For example:
 
-## Step 2: run VGGT per synchronized frame
+- `CCTV_01_000000.png` -> camera name `CCTV_01`, frame id `0`.
+- `Drone_Main_000000.png` -> camera name `Drone_Main`, frame id `0`.
 
-python run_vggt_anchor_batches_v4.py \
-  --all_images /data/all_images \
+This is important when the folder name is `try_drone` but the image prefix is `Drone_Main`.
+
+Subfolders named `depth`, `depths`, `mask`, `masks`, `seg`, `semantic`, etc. are ignored.
+
+## Step 1: run VGGT per synchronized frame
+
+For one moving camera:
+
+```bash
+python mytoolsfor4dgs/run_vggt_anchor_batches_v4.py \
+  --dataset_root "/home/wenbo/Documents/Unreal Projects/city_1_datasets" \
   --work_root /data/vggt_anchor_work \
   --vggt_repo /path/to/vggt_wenbo \
-  --fixed_cams cctv1,cctv2,cctv3,cctv4 \
-  --moving_cam phone1 \
+  --moving_cams Drone_Main \
   --use_ba \
   --camera_type PINHOLE \
   --query_frame_num 0 \
   --skip_existing
+```
 
-For every frame id, the script creates a temporary VGGT scene containing all fixed cameras plus the moving camera, then runs VGGT demo_colmap.py.
+For multiple moving cameras:
 
-## Step 3: build the final VGGTView scene
-
-python build_vggtview_scene_v4.py \
+```bash
+python mytoolsfor4dgs/run_vggt_anchor_batches_v4.py \
+  --dataset_root "/home/wenbo/Documents/Unreal Projects/city_1_datasets" \
   --work_root /data/vggt_anchor_work \
-  --all_images /data/all_images \
+  --vggt_repo /path/to/vggt_wenbo \
+  --moving_cams Drone_Main,Phone_Main \
+  --use_ba \
+  --camera_type PINHOLE \
+  --query_frame_num 0 \
+  --skip_existing
+```
+
+If `--fixed_cams` is not given, the script infers:
+
+```text
+fixed_cams = all detected cameras - moving_cams
+```
+
+For example, if all detected cameras are:
+
+```text
+CCTV_01, CCTV_02, CCTV_03, Drone_Main, Phone_Main
+```
+
+and you pass:
+
+```text
+--moving_cams Drone_Main,Phone_Main
+```
+
+then the fixed anchors are inferred as:
+
+```text
+CCTV_01, CCTV_02, CCTV_03
+```
+
+You can still manually specify fixed cameras:
+
+```bash
+--fixed_cams CCTV_01,CCTV_02,CCTV_03 --moving_cams Drone_Main,Phone_Main
+```
+
+`--normalize_images` is on by default. It applies EXIF orientation and writes clean RGB images into every temporary VGGT scene. Keep this on for phone / drone / portrait images.
+
+## Step 2: build the final VGGTView scene
+
+For one moving camera:
+
+```bash
+python mytoolsfor4dgs/build_vggtview_scene_v4.py \
+  --work_root /data/vggt_anchor_work \
+  --dataset_root "/home/wenbo/Documents/Unreal Projects/city_1_datasets" \
   --out_scene /data/final_scene \
-  --fixed_cams cctv1,cctv2,cctv3,cctv4 \
-  --moving_cam phone1 \
-  --intrinsic_mode per_prefix \
+  --moving_cams Drone_Main \
+  --intrinsic_mode per_image \
   --with_scale
+```
+
+For multiple moving cameras:
+
+```bash
+python mytoolsfor4dgs/build_vggtview_scene_v4.py \
+  --work_root /data/vggt_anchor_work \
+  --dataset_root "/home/wenbo/Documents/Unreal Projects/city_1_datasets" \
+  --out_scene /data/final_scene \
+  --moving_cams Drone_Main,Phone_Main \
+  --intrinsic_mode per_image \
+  --with_scale
+```
+
+Again, if `--fixed_cams` is not provided, fixed cameras are inferred as:
+
+```text
+all cameras - moving_cams
+```
+
+The fixed cameras are used only as anchors for alignment. Their poses are forced to the reference-frame global poses. All moving cameras are transformed by the same alignment for each frame, so they keep their frame-varying trajectories.
 
 Outputs:
 
-- /data/final_scene/images
-- /data/final_scene/sparse/0/points3D.txt
-- /data/final_scene/sparse/0/cameras.txt
-- /data/final_scene/sparse/0/images.txt
-- /data/final_scene/vggtview_meta.json
+```text
+final_scene/
+  images/
+  sparse/0/points3D.txt
+  sparse/0/cameras.txt
+  sparse/0/images.txt
+  vggtview_meta.json
+```
 
-The vggtview_meta.json file stores each image's global pose, intrinsics, camera name, frame id, and normalized time.
+`vggtview_meta.json` stores every image's global pose, camera intrinsics, camera name, frame id, normalized time, `is_fixed`, and `is_moving`.
 
-## Step 4: patch 4DGS to add VGGTView reader
+## Step 3: train 4DGS
 
-python patch_4dgs_add_vggtview_reader_v4.py --four_dgs_repo /path/to/4DGaussians_wenbo
+Make sure your 4DGaussians repository has the VGGTView reader patch. Then:
 
-This modifies only:
-
-- scene/dataset_readers.py
-- scene/__init__.py
-
-Backups are created with suffix .bak_vggtview_v4.
-
-## Step 5: train 4DGS
-
+```bash
 cd /path/to/4DGaussians_wenbo
-python train.py -s /data/final_scene --configs arguments/hypernerf/default.py --model_path /data/output_model
+python train.py \
+  -s /data/final_scene \
+  --configs arguments/hypernerf/default.py \
+  --model_path /data/output_model
+```
 
-Because final_scene contains vggtview_meta.json, 4DGS will use the VGGTView reader.
-
-## Conservative COLMAP route
-
-build_vggtview_scene_v4.py also writes cameras.txt and images.txt in sparse/0. This is mainly for inspection and conservative debugging. Standard COLMAP has no dynamic time field, so for real dynamic training VGGTView is safer.
+4DGS reads `final_scene/vggtview_meta.json`, so it does not need to know the original `dataset_root` structure.
 
 ## Important options
 
---fixed_cams
-Comma separated list of fixed cameras. Use at least two. More fixed cameras improve alignment stability.
+### `--moving_cams`
 
---moving_cam
-The one moving camera. v4 supports one moving camera.
+Comma-separated moving camera names. Use image filename prefixes, not folder names. Example:
 
---intrinsic_mode per_prefix
-All frames from the same camera prefix share one camera_id. Good for fixed focal length cameras.
+```text
+--moving_cams Drone_Main,Phone_Main
+```
 
---intrinsic_mode per_image
-Every image gets its own camera_id. Safer if phone/uav intrinsics may change.
+The old `--moving_cam` option is still accepted for one moving camera, but `--moving_cams` is recommended.
 
---with_scale
-Use Sim3 alignment. This is recommended because independent VGGT runs may have slightly different scale.
+### `--fixed_cams`
 
---no_scale
-Use rotation and translation only.
+Comma-separated fixed anchor camera names. Optional. If omitted, fixed cameras are inferred automatically.
 
-## What the code does not solve
+### `--intrinsic_mode per_image`
 
-It does not segment dynamic objects. If moving objects dominate the fixed-camera views, VGGT pose estimation may be unstable. Masking or choosing cleaner keyframes can improve results.
+Recommended for mixed camera types, phone/drone images, portrait/landscape mixes, or any case where image size/intrinsics may vary.
 
-It supports one moving camera by default. Multiple moving cameras require extending --moving_cam to a moving camera list.
+### `--intrinsic_mode per_prefix`
+
+Only use this if each camera prefix always has the same resolution and stable intrinsics.
+
+### `--camera_type PINHOLE`
+
+Recommended for VGGT BA mode because it preserves `fx`, `fy`, `cx`, and `cy` separately.
+
+## Files changed for multi-moving-camera support
+
+- `run_vggt_anchor_batches_v4.py`: accepts `--moving_cams`, infers fixed anchors from all detected cameras minus all moving cameras, and includes all moving cameras in every per-frame VGGT batch.
+- `build_vggtview_scene_v4.py`: accepts `--moving_cams`, aligns using only fixed anchors, writes all moving cameras into `vggtview_meta.json`, and marks each image with `is_moving`.
+- `README_vggtview_4dgs_v4.md`: updated usage examples.
+
+`colmap_io_minimal.py` does not need changes.
+
+## Current limitations
+
+At least two fixed cameras are still required for stable anchor alignment. Multiple moving cameras are supported, but they must all appear in the synchronized frames you want to process.

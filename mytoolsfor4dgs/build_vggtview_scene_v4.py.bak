@@ -7,9 +7,7 @@ frame using all fixed cameras as anchors. It then writes:
     final_scene/sparse/0/points3D.txt
     final_scene/vggtview_meta.json
 
-This version is compatible with both flat image folders and per-camera folder
-exports. It prefers the normalized images inside each per-frame VGGT work scene,
-which avoids phone/drone EXIF orientation mismatches.
+Optionally, it also writes COLMAP-style cameras.txt/images.txt for debugging.
 """
 
 from __future__ import annotations
@@ -24,7 +22,7 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 
 import numpy as np
-from PIL import Image as PILImage, ImageOps
+from PIL import Image as PILImage
 
 from colmap_io_minimal import (
     Camera,
@@ -38,13 +36,8 @@ from colmap_io_minimal import (
     write_images_text,
 )
 
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".bmp", ".webp", ".tif", ".tiff"}
-DEFAULT_IGNORE_DIRS = {"depth", "depths", "mask", "masks", "seg", "segs", "semantic", "semantics"}
-
 
 def parse_csv(value: str) -> List[str]:
-    if value is None:
-        return []
     return [x.strip() for x in value.split(",") if x.strip()]
 
 
@@ -54,17 +47,6 @@ def parse_cam_frame(name: str) -> Tuple[str, int]:
     if not m:
         raise ValueError(f"Cannot parse camera/frame from {name}; expected camera_000001.png")
     return m.group("cam"), int(m.group("frame"))
-
-
-def infer_camera_names(images: Dict[int, Image]) -> List[str]:
-    cams = set()
-    for im in images.values():
-        try:
-            cam, _ = parse_cam_frame(im.name)
-            cams.add(cam)
-        except ValueError:
-            continue
-    return sorted(cams)
 
 
 def find_image_by_camera(images: Dict[int, Image], cam_name: str) -> Image:
@@ -112,6 +94,9 @@ def estimate_alignment_from_anchors(
     if len(cams) < 2:
         raise ValueError("At least two fixed anchors are required.")
 
+    # Rotation candidates from camera orientation relation:
+    # Rcw_global = Rcw_local @ R_align.T
+    # R_align = Rcw_global.T @ Rcw_local
     rotations = []
     for cam in cams:
         Rcw_l = qvec2rotmat(local_anchor_images[cam].qvec)
@@ -169,58 +154,26 @@ def camera_params_to_pinhole(cam: Camera) -> Tuple[str, List[float]]:
     model = cam.model
     p = [float(x) for x in cam.params]
     if model == "PINHOLE":
-        if len(p) < 4:
-            raise ValueError(f"PINHOLE camera {cam.id} has fewer than 4 params: {p}")
-        return "PINHOLE", p[:4]
+        return model, p[:4]
     if model in ["SIMPLE_PINHOLE", "SIMPLE_RADIAL"]:
         f = p[0]
         cx = p[1] if len(p) > 1 else cam.width / 2.0
         cy = p[2] if len(p) > 2 else cam.height / 2.0
         return "PINHOLE", [f, f, cx, cy]
     if model == "OPENCV":
-        if len(p) < 4:
-            raise ValueError(f"OPENCV camera {cam.id} has fewer than 4 params: {p}")
         return "PINHOLE", p[:4]
     raise ValueError(f"Unsupported camera model {model}; use VGGT --camera_type PINHOLE if possible.")
-
-
-def rescale_pinhole_params(params: List[float], src_w: int, src_h: int, dst_w: int, dst_h: int) -> List[float]:
-    fx, fy, cx, cy = [float(x) for x in params[:4]]
-    if src_w <= 0 or src_h <= 0:
-        raise ValueError(f"Invalid source camera size: {src_w}x{src_h}")
-    sx = float(dst_w) / float(src_w)
-    sy = float(dst_h) / float(src_h)
-    return [fx * sx, fy * sy, cx * sx, cy * sy]
-
-
-def validate_pinhole_params(params: List[float], width: int, height: int, image_name: str) -> None:
-    fx, fy, cx, cy = [float(x) for x in params[:4]]
-    if fx <= 0 or fy <= 0:
-        raise ValueError(f"Invalid focal for {image_name}: fx={fx}, fy={fy}")
-    if not (-0.25 * width <= cx <= 1.25 * width and -0.25 * height <= cy <= 1.25 * height):
-        print(f"[WARN] principal point unusual for {image_name}: cx={cx:.2f}, cy={cy:.2f}, size={width}x{height}")
 
 
 def choose_camera_record(
     src_cam: Camera,
     camera_name: str,
     image_name: str,
-    actual_width: int,
-    actual_height: int,
     mode: str,
     camera_registry: Dict[str, int],
     cameras_out: Dict[int, Camera],
 ) -> int:
     model, params = camera_params_to_pinhole(src_cam)
-    if int(src_cam.width) != int(actual_width) or int(src_cam.height) != int(actual_height):
-        print(
-            f"[INFO] rescale intrinsics for {image_name}: "
-            f"VGGT/COLMAP {src_cam.width}x{src_cam.height} -> image {actual_width}x{actual_height}"
-        )
-        params = rescale_pinhole_params(params, int(src_cam.width), int(src_cam.height), int(actual_width), int(actual_height))
-
-    validate_pinhole_params(params, int(actual_width), int(actual_height), image_name)
-
     if mode == "per_image":
         key = image_name
     elif mode == "per_prefix":
@@ -229,19 +182,11 @@ def choose_camera_record(
         raise ValueError(f"Unknown intrinsic mode {mode}")
 
     if key in camera_registry:
-        cam_id = camera_registry[key]
-        existing = cameras_out[cam_id]
-        if mode == "per_prefix" and (int(existing.width) != int(actual_width) or int(existing.height) != int(actual_height)):
-            raise RuntimeError(
-                f"Camera prefix {camera_name} has changing image size: "
-                f"existing {existing.width}x{existing.height}, new {actual_width}x{actual_height}. "
-                "Use --intrinsic_mode per_image."
-            )
-        return cam_id
+        return camera_registry[key]
 
     cam_id = len(camera_registry) + 1
     camera_registry[key] = cam_id
-    cameras_out[cam_id] = Camera(cam_id, model, int(actual_width), int(actual_height), np.array(params, dtype=np.float64))
+    cameras_out[cam_id] = Camera(cam_id, model, int(src_cam.width), int(src_cam.height), np.array(params, dtype=np.float64))
     return cam_id
 
 
@@ -256,64 +201,16 @@ def link_or_copy(src: Path, dst: Path, mode: str) -> None:
         raise ValueError(mode)
 
 
-def build_source_index(root: Path | None, ignore_dirs: List[str]) -> Dict[str, Path]:
-    """Build filename -> path index from a flat folder or per-camera root."""
-    result: Dict[str, Path] = {}
-    if root is None:
-        return result
-    ignore = {x.lower() for x in ignore_dirs}
-
-    def add(p: Path) -> None:
-        if p.suffix.lower() not in IMAGE_EXTS:
-            return
-        if p.name in result and result[p.name].resolve() != p.resolve():
-            raise RuntimeError(f"Duplicate image filename {p.name}: {result[p.name]} and {p}")
-        result[p.name] = p
-
-    for p in sorted(root.iterdir()):
-        if p.is_file():
-            add(p)
-        elif p.is_dir() and not p.name.startswith(".") and p.name.lower() not in ignore:
-            for q in sorted(p.iterdir()):
-                if q.is_file():
-                    add(q)
-    return result
-
-
-def get_image_size(path: Path) -> Tuple[int, int]:
-    with PILImage.open(path) as pil:
-        pil = ImageOps.exif_transpose(pil)
-        return int(pil.size[0]), int(pil.size[1])
-
-
-def resolve_source_image(image_name: str, frame_dir: Path, source_index: Dict[str, Path]) -> Path:
-    # Prefer the exact image VGGT used. If run_vggt_anchor_batches_v4.py normalized
-    # phone/drone images, this path has the clean orientation.
-    candidate = frame_dir / "images" / image_name
-    if candidate.exists() or candidate.is_symlink():
-        return candidate
-    if image_name in source_index:
-        return source_index[image_name]
-    raise FileNotFoundError(f"Cannot find source image {image_name}. Checked {candidate} and source index.")
-
-
 def main() -> None:
     parser = argparse.ArgumentParser()
     parser.add_argument("--work_root", required=True, type=Path)
+    parser.add_argument("--all_images", required=True, type=Path)
     parser.add_argument("--out_scene", required=True, type=Path)
-    parser.add_argument("--all_images", default=None, type=Path,
-                        help="Old flat image folder. Optional; frame_dir/images is preferred.")
-    parser.add_argument("--dataset_root", default=None, type=Path,
-                        help="New per-camera folder dataset root. Optional; frame_dir/images is preferred.")
-    parser.add_argument("--fixed_cams", default="",
-                        help="Comma separated fixed camera names. Empty means infer all cameras except moving cameras.")
-    parser.add_argument("--moving_cam", default="",
-                        help="Deprecated single moving camera name. Prefer --moving_cams.")
-    parser.add_argument("--moving_cams", default="",
-                        help="Comma separated moving camera names, e.g. Drone_Main,Phone_Main. Empty means use --moving_cam if provided.")
+    parser.add_argument("--fixed_cams", required=True, help="Comma separated fixed camera names.")
+    parser.add_argument("--moving_cam", required=True, help="The one moving camera name.")
     parser.add_argument("--reference_frame", type=int, default=None,
                         help="Default: first available complete frame.")
-    parser.add_argument("--intrinsic_mode", choices=["per_prefix", "per_image"], default="per_image")
+    parser.add_argument("--intrinsic_mode", choices=["per_prefix", "per_image"], default="per_prefix")
     parser.add_argument("--with_scale", action="store_true", default=True)
     parser.add_argument("--no_scale", action="store_true", help="Disable Sim3 scale, use SE3 only.")
     parser.add_argument("--link_mode", choices=["copy", "symlink"], default="symlink")
@@ -321,8 +218,13 @@ def main() -> None:
                         help="Also write cameras.txt/images.txt for debugging and conservative COLMAP route.")
     parser.add_argument("--warn_center_rms", type=float, default=0.05)
     parser.add_argument("--warn_rotation_deg", type=float, default=5.0)
-    parser.add_argument("--ignore_dirs", default=",".join(sorted(DEFAULT_IGNORE_DIRS)))
     args = parser.parse_args()
+
+    fixed_cams = parse_csv(args.fixed_cams)
+    moving_cam = args.moving_cam.strip()
+    required = fixed_cams + [moving_cam]
+    if len(fixed_cams) < 2:
+        raise ValueError("Need at least two fixed cameras.")
 
     frame_dirs = []
     for p in sorted(args.work_root.glob("frame_*")):
@@ -340,43 +242,11 @@ def main() -> None:
     if ref_dir is None:
         raise RuntimeError(f"Reference frame {ref_frame} not found in work_root")
 
-    ref_cameras, ref_images, _ref_points = read_model_sparse(str(ref_dir / "sparse"))
-    all_cams = infer_camera_names(ref_images)
-    if not all_cams:
-        raise RuntimeError(f"Could not infer camera names from {ref_dir / 'sparse' / 'images.bin'}")
-
-    moving_cams = parse_csv(args.moving_cams)
-    legacy_moving_cam = args.moving_cam.strip()
-    if legacy_moving_cam and not moving_cams:
-        moving_cams = [legacy_moving_cam]
-    moving_cams = list(dict.fromkeys(moving_cams))
-
-    missing_moving = [c for c in moving_cams if c not in all_cams]
-    if missing_moving:
-        raise ValueError(f"moving_cams not found in reference frame: {missing_moving}. Available cameras: {all_cams}")
-
-    fixed_cams = parse_csv(args.fixed_cams)
-    if not fixed_cams:
-        moving_set = set(moving_cams)
-        fixed_cams = [c for c in all_cams if c not in moving_set] if moving_cams else all_cams.copy()
-        print(f"[INFO] inferred fixed_cams: {fixed_cams}")
-    missing_fixed = [c for c in fixed_cams if c not in all_cams]
-    if missing_fixed:
-        raise ValueError(f"fixed_cams not found in reference frame: {missing_fixed}. Available cameras: {all_cams}")
-
-    overlap = sorted(set(fixed_cams).intersection(moving_cams))
-    if overlap:
-        raise ValueError(f"Camera(s) cannot be both fixed and moving: {overlap}")
-    if len(fixed_cams) < 2:
-        raise ValueError("Need at least two fixed cameras for anchor alignment.")
-
-    required = list(dict.fromkeys(fixed_cams + moving_cams))
-
+    ref_cameras, ref_images, ref_points = read_model_sparse(str(ref_dir / "sparse"))
     global_anchor_images = {cam: find_image_by_camera(ref_images, cam) for cam in fixed_cams}
 
-    source_root = args.dataset_root if args.dataset_root is not None else args.all_images
-    source_index = build_source_index(source_root, ignore_dirs=parse_csv(args.ignore_dirs))
-
+    # Use reference-frame fixed cameras as fixed global poses. The moving camera at
+    # reference frame also gets its aligned global pose from the reference model.
     images_meta = []
     cameras_out: Dict[int, Camera] = {}
     images_out: Dict[int, Image] = {}
@@ -403,43 +273,43 @@ def main() -> None:
         stats["frame_id"] = int(frame_id)
         alignment_report.append(stats)
         if stats["center_rms"] > args.warn_center_rms or stats["rotation_max_deg"] > args.warn_rotation_deg:
-            print(
-                f"[WARN] frame {frame_id}: center_rms={stats['center_rms']:.6f}, "
-                f"rot_max={stats['rotation_max_deg']:.3f} deg, scale={stats['scale']:.6f}"
-            )
+            print(f"[WARN] frame {frame_id}: center_rms={stats['center_rms']:.6f}, "
+                  f"rot_max={stats['rotation_max_deg']:.3f} deg, scale={stats['scale']:.6f}")
 
         for cam_name in required:
             im_local = find_image_by_camera(images, cam_name)
             src_cam = cameras[im_local.camera_id]
             qvec_g, tvec_g = transform_image_pose_to_global(im_local, scale, R_align, t_align)
 
-            # Fixed cameras are global anchors. Enforce exactly the reference pose.
+            # For fixed cameras, enforce exactly the reference-frame global pose.
             if cam_name in fixed_cams:
                 im_ref = global_anchor_images[cam_name]
                 qvec_g = np.asarray(im_ref.qvec, dtype=np.float64)
                 tvec_g = np.asarray(im_ref.tvec, dtype=np.float64)
 
-            image_src = resolve_source_image(im_local.name, frame_dir, source_index)
+            image_src = args.all_images / im_local.name
+            if not image_src.exists():
+                # fallback to per-frame VGGT images folder
+                image_src = frame_dir / "images" / im_local.name
+            if not image_src.exists():
+                raise FileNotFoundError(f"Cannot find source image {im_local.name}")
             image_dst = out_images / im_local.name
             link_or_copy(image_src, image_dst, args.link_mode)
 
-            width, height = get_image_size(image_src)
-            if width < height:
-                print(f"[INFO] portrait image detected: {im_local.name} size={width}x{height}")
+            # Get actual image size if available; keep VGGT camera otherwise.
+            width, height = int(src_cam.width), int(src_cam.height)
+            try:
+                with PILImage.open(image_src) as pil:
+                    width, height = pil.size
+            except Exception:
+                pass
 
-            cam_id = choose_camera_record(
-                src_cam,
-                cam_name,
-                im_local.name,
-                width,
-                height,
-                args.intrinsic_mode,
-                camera_registry,
-                cameras_out,
-            )
+            # If source camera dimensions differ from actual, keep params as produced
+            # by VGGT demo_colmap, which already rescales to original resolution.
+            cam_id = choose_camera_record(src_cam, cam_name, im_local.name, args.intrinsic_mode, camera_registry, cameras_out)
+            cameras_out[cam_id] = cameras_out[cam_id]._replace(width=width, height=height)
 
             time = float((frame_id - min_frame) / denom)
-            out_cam = cameras_out[cam_id]
             entry = {
                 "image_name": im_local.name,
                 "image_path": f"images/{im_local.name}",
@@ -447,14 +317,14 @@ def main() -> None:
                 "frame_id": int(frame_id),
                 "time": time,
                 "camera_id": int(cam_id),
-                "camera_model": out_cam.model,
-                "width": int(out_cam.width),
-                "height": int(out_cam.height),
-                "params": [float(x) for x in out_cam.params],
+                "camera_model": cameras_out[cam_id].model,
+                "width": int(cameras_out[cam_id].width),
+                "height": int(cameras_out[cam_id].height),
+                "params": [float(x) for x in cameras_out[cam_id].params],
                 "qvec": [float(x) for x in qvec_g],
                 "tvec": [float(x) for x in tvec_g],
                 "is_fixed": cam_name in fixed_cams,
-                "is_moving": cam_name in moving_cams,
+                "is_moving": cam_name == moving_cam,
             }
             images_meta.append(entry)
 
@@ -469,6 +339,7 @@ def main() -> None:
             )
             image_id_next += 1
 
+    # Initial point cloud: use the reference frame sparse point cloud.
     copy_points_to_text(str(ref_dir / "sparse"), str(out_sparse))
 
     if args.write_colmap_text:
@@ -479,11 +350,8 @@ def main() -> None:
         "format": "VGGTView",
         "version": 4,
         "description": "Anchor-aligned VGGT camera poses for 4DGS.",
-        "all_cameras": all_cams,
         "fixed_cams": fixed_cams,
-        "moving_cams": moving_cams,
-        "moving_cam": moving_cams[0] if len(moving_cams) == 1 else "",
-        "required_cams": required,
+        "moving_cam": moving_cam,
         "reference_frame": int(ref_frame),
         "frame_min": int(min_frame),
         "frame_max": int(max_frame),
@@ -499,7 +367,6 @@ def main() -> None:
     print(f"[OK] images: {out_images}")
     print(f"[OK] meta: {args.out_scene / 'vggtview_meta.json'}")
     print(f"[OK] sparse: {out_sparse}")
-    print(f"[OK] intrinsic_mode: {args.intrinsic_mode}")
 
 
 if __name__ == "__main__":
